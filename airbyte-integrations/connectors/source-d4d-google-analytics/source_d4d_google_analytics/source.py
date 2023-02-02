@@ -15,6 +15,7 @@ import jwt
 import pendulum
 import requests
 from airbyte_cdk.models import SyncMode
+from airbyte_cdk.logger import AirbyteLogger
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
 from airbyte_cdk.sources.streams.availability_strategy import AvailabilityStrategy
@@ -103,7 +104,7 @@ class GoogleAnalyticsV4Stream(HttpStream, ABC):
         super().__init__(authenticator=config["authenticator"])
         self.start_date = config["start_date"]
         self.window_in_days: int = config.get("window_in_days", 1)
-        self.view_id = config["view_id"]
+        self.view_ids = config["view_ids"]
         self.metrics = config["metrics"]
         self.dimensions = config["dimensions"]
         self.segments = config.get("segments", list())
@@ -183,17 +184,21 @@ class GoogleAnalyticsV4Stream(HttpStream, ABC):
         dimensions = [{"name": dimension} for dimension in self.dimensions]
         segments = [{"segmentId": segment} for segment in self.segments]
         filtersExpression = self.filtersExpression
-
+        view_id = self._config.get("view_id", None)
+        daterange = [stream_slice]
+        if stream_slice and stream_slice.get("view_id") and stream_slice.get("startDate") and stream_slice.get("endDate"):
+            view_id = stream_slice.get("view_id")
+            daterange = [{"startDate": stream_slice.get("startDate"), "endDate": stream_slice.get("endDate")}]
         request_body = {
             "reportRequests": [
                 {
-                    "viewId": self.view_id,
-                    "dateRanges": [stream_slice],
+                    "viewId": view_id,
+                    "dateRanges": daterange,
                     "pageSize": self.page_size,
                     "metrics": metrics,
                     "dimensions": dimensions,
                     "segments": segments,
-                    "filtersExpression": filtersExpression,
+                    "filtersExpression": filtersExpression
                 }
             ]
         }
@@ -268,12 +273,13 @@ class GoogleAnalyticsV4Stream(HttpStream, ABC):
         date_slices = []
         slice_start_date = start_date
         while slice_start_date <= end_date:
-            slice_end_date = slice_start_date.add(days=self.window_in_days)
-            # limit the slice range with end_date
-            slice_end_date = min(slice_end_date, end_date)
-            date_slices.append({"startDate": self.to_datetime_str(slice_start_date), "endDate": self.to_datetime_str(slice_end_date)})
-            # start next slice 1 day after previous slice ended to prevent duplicate reads
-            slice_start_date = slice_end_date.add(days=1)
+            for view_id in self.view_ids:
+                slice_end_date = slice_start_date.add(days=self.window_in_days)
+                # limit the slice range with end_date
+                slice_end_date = min(slice_end_date, end_date)
+                date_slices.append({"view_id":view_id,"startDate": self.to_datetime_str(slice_start_date), "endDate": self.to_datetime_str(slice_end_date)})
+                # start next slice 1 day after previous slice ended to prevent duplicate reads
+                slice_start_date = slice_end_date.add(days=1)
         return date_slices or [None]
 
     @staticmethod
@@ -411,6 +417,7 @@ class GoogleAnalyticsV4Stream(HttpStream, ABC):
         if not json_response:
             return []
         reports = json_response.get(self.report_field, [])
+        view_id = kwargs.get('stream_slice',{}).get("view_id","")
 
         for report in reports:
             column_header = report.get("columnHeader", {})
@@ -438,7 +445,7 @@ class GoogleAnalyticsV4Stream(HttpStream, ABC):
 
                         record[metric_name.replace("ga:", "ga_")] = value
 
-                record["view_id"] = self.view_id
+                record["view_id"] = view_id
                 record["isDataGolden"] = report.get("data", {}).get("isDataGolden", False)
                 yield record
 
@@ -464,6 +471,7 @@ class GoogleAnalyticsV4IncrementalObjectsBase(GoogleAnalyticsV4Stream):
     ) -> Iterable[Mapping[str, Any]]:
         if not stream_slice:
             return []
+        
         return super().read_records(sync_mode, cursor_field, stream_slice, stream_state)
 
 
@@ -554,7 +562,7 @@ class TestStreamConnection(GoogleAnalyticsV4Stream):
         return res.get("reports", {})[0].get("data")
 
 
-class SourceD4dDcSeoReport(AbstractSource):
+class SourceD4DGoogleAnalytics(AbstractSource):
     """Google Analytics lets you analyze data about customer engagement with your website or application."""
 
     @staticmethod
@@ -576,7 +584,7 @@ class SourceD4dDcSeoReport(AbstractSource):
                 scopes=["https://www.googleapis.com/auth/analytics.readonly"],
             )
 
-    def check_connection(self, logger: logging.Logger, config: MutableMapping) -> Tuple[bool, Any]:
+    def check_connection(self, logger: AirbyteLogger, config: MutableMapping) -> Tuple[bool, Any]:
         # declare additional variables
         authenticator = self.get_authenticator(config)
         config["authenticator"] = authenticator
@@ -585,18 +593,17 @@ class SourceD4dDcSeoReport(AbstractSource):
 
         # load and verify the custom_reports
         try:
-            # test the eligibility of custom_reports input
-            custom_reports = config.get("custom_reports")
-            if custom_reports:
-                CustomReportsValidator(json.loads(custom_reports)).validate()
             # Read records to check the reading permissions
-            read_check = list(TestStreamConnection(config).read_records(sync_mode=None))
-            if read_check:
-                return True, None
-            return (
-                False,
-                f"Please check the permissions for the requested view_id: {config['view_id']}. Cannot retrieve data from that view ID.",
-            )
+            view_ids = config.get("view_ids", [])
+            for view_id in view_ids:
+                config['view_id'] = view_id
+                read_check = list(TestStreamConnection(config).read_records(sync_mode=None))
+                if not read_check:
+                    return (
+                        False,
+                        f"Please check the permissions for the requested view_id: {config['view_id']}. Cannot retrieve data from that view ID.",
+                    )
+            return True, None
         except ValueError as e:
             return False, f"Invalid custom reports json structure. {e}"
         except requests.exceptions.RequestException as e:
@@ -613,33 +620,17 @@ class SourceD4dDcSeoReport(AbstractSource):
 
         config["authenticator"] = authenticator
 
-        reports = json.loads(pkgutil.get_data("source_google_analytics_v4", "defaults/default_reports.json"))
 
-        custom_reports = config.get("custom_reports")
-        if custom_reports:
-            custom_reports = json.loads(custom_reports)
-            custom_reports = [custom_reports] if not isinstance(custom_reports, list) else custom_reports
-            reports += custom_reports
+        stream_name = f"seo-report"
+        # stream_bases = (GoogleAnalyticsV4Stream,)
 
-        config["ga_streams"] = reports
+        # if "ga:date" in config["dimensions"]:
+        stream_bases = (GoogleAnalyticsV4IncrementalObjectsBase,)
 
-        for stream in config["ga_streams"]:
-            config["metrics"] = stream["metrics"]
-            config["dimensions"] = stream["dimensions"]
-            config["segments"] = stream.get("segments", list())
-            config["filter"] = stream.get("filter", "")
-
-            # construct GAReadStreams sub-class for each stream
-            stream_name = stream["name"]
-            stream_bases = (GoogleAnalyticsV4Stream,)
-
-            if "ga:date" in stream["dimensions"]:
-                stream_bases = (GoogleAnalyticsV4IncrementalObjectsBase,)
-
-            stream_class = type(stream_name, stream_bases, {})
+        stream_class = type(stream_name, stream_bases, {})
 
             # instantiate a stream with config
-            stream_instance = stream_class(config)
-            streams.append(stream_instance)
+        stream_instance = stream_class(config)
+        streams.append(stream_instance)
 
         return streams
